@@ -1,7 +1,7 @@
 ---
 title: "CEVE 543 Fall 2025 Lab 8: Weather Typing Implementation"
 subtitle: "K-means clustering for synoptic pattern classification"
-author: CEVE 543 Fall 2025
+author: Dongwook Kim
 date: "2025-10-31"
 type: "lab"
 module: 2
@@ -574,14 +574,111 @@ Answer the following questions about the weather typing methodology:
 ### Implementation Questions
 
 - Explain in your own words what the `assign_to_nearest_centroid` function does and why it's important for k-means clustering.
+> This function calculates the distance between each data point and each cluster centroid. This is the first step that determines which cluster the data belongs to.
+
 - Explain in your own words what the `update_centroids` function does and why it's important for k-means clustering.
+> After assigning data points to clusters using the assign_to_nearest_centroid function, "update_centroids" function calculates the mean of the data points belonging to each cluster and then moves the centroid to the location of that mean. This process is repeated until the model converges.
+
 - Why does k-means use squared Euclidean distance rather than absolute distance? What would happen if you used absolute distance instead?
+> K-means is an algorithm that aims to minimize the distance between cluster centorids and each observation, and Euclidean distance refers to the straight-line distance (shortest distance) between two points. Using absolute distance (Manhattan distance) results in the K-medians method rather than K-means, and since the median is robust to extreme values, it is more resilient than K-means when outliers are present. (https://en.wikipedia.org/wiki/K-medians_clustering)
 
 ### Weather Typing Analysis
 
 - Visualize streamfunction anomalies for at least 3 different days. Then, identify the weather types for each day. How well do individual days match their cluster composite patterns?
+```{julia}
+plot_streamfunction_anomaly(Date(1979, 01, 01))
+plot_streamfunction_anomaly(Date(1989, 12, 31))
+plot_streamfunction_anomaly(Date(2025, 02, 28))
+```
+
+> Each grid cell shows spatial patterns similar to Type 4 for 1979-01-01, Type 5 for 1989-12-31, and Type 6 for 2025-02-28. 
+
 - Do your EOF spatial patterns match those shown in the paper?
+> Although there are slight differences in the paper's results, resolution, and explained variance values, the spatial patterns seem very similar. 
+
 - Do your weather type composites used with default settings (approximately matching the paper) match those in the paper? If not, why might they differ?
+> While there are differences in the paper's results and resolution, the spatial patterns seem very similar. 
+
 - What is the effect of changing the number of retained PCs on the weather type patterns?
+> The number of principal components represents the amount of information I use. For example, if the variance explained by the first four principal components is 90%, only 90% of the total information will be utilized, describing it across four dimensions. If the number of principal components is small, weather types may be simplified based on the amount of explained variance. Conversely, if the number is big, the dimensions increase and patterns become more subdivided, making interpretation more difficult.
+
 - What is the effect of rescaling PCs before clustering? Try clustering without rescaling and compare results.
+```{julia}
+rescale_pcs = false
+if rescale_pcs
+    pc_scores_scaled = (pc_scores .- mean(pc_scores, dims=1)) ./ std(pc_scores, dims=1)
+else
+    pc_scores_scaled = pc_scores
+end
+
+let
+    k_values = 3:10
+    wcss_values = [kmeans(Matrix(pc_scores_scaled), k; verbose=false).wcss for k in k_values]
+
+    fig = Figure(size=(800, 600))
+    ax = Axis(fig[1, 1],
+        xlabel="Number of Clusters",
+        ylabel="Within-Cluster Sum of Squares",
+        title="Elbow Method for Optimal k",
+        xticks=k_values)
+    lines!(ax, k_values, wcss_values, color=:steelblue, linewidth=2)
+    scatter!(ax, k_values, wcss_values, color=:steelblue, markersize=12)
+    fig
+end
+```
+```{julia}
+n_clusters = 6
+result = kmeans(Matrix(pc_scores_scaled), n_clusters; verbose=true)
+
+println("\nConverged: $(result.converged)")
+println("Iterations: $(result.iterations)")
+println("Final WCSS: $(round(result.wcss, digits=2))")
+
+println("\nCluster sizes (ordered largest to smallest):")
+for i in 1:n_clusters
+    count = sum(result.labels .== i)
+    println("  Cluster $i: $count days ($(round(count/length(result.labels)*100, digits=1))%)")
+end
+```
+```{julia}
+let
+    # Calculate composite (mean) streamfunction anomaly for each cluster
+    composites = zeros(nlons, nlats, n_clusters)
+
+    for k in 1:n_clusters
+        cluster_days = findall(result.labels .== k)
+        cluster_data = ψ_array[:, :, cluster_days]
+        composites[:, :, k] = mean(cluster_data, dims=3)[:, :, 1]
+    end
+
+    # Determine color range for consistent scaling across all plots
+    crange = maximum(abs.(extrema(composites)))
+    crange = (-crange, crange)
+
+    # Plot all weather type composites
+    fig = Figure(size=(1400, 1000))
+
+    for k in 1:n_clusters
+        row = div(k - 1, 3) + 1
+        col = mod(k - 1, 3) + 1
+
+        ax = create_geoaxis(fig, (row, col);
+            title="Weather Type $k (n=$(sum(result.labels .== k)))")
+
+        hm = heatmap!(ax, Array(ψ_climatology.lon), Array(ψ_climatology.lat), composites[:, :, k];
+            colormap=cmap_diverging, colorrange=crange)
+        add_boundaries!(ax)
+    end
+
+    # Add single shared colorbar
+    Colorbar(fig[:, 4], limits=crange, colormap=cmap_diverging,
+        label=L"$\psi$ Anomaly ($10^6$ m$^2$/s)")
+
+    fig
+end
+```
+
+> If PCs are used without scaling, the influence of the first principal component will be the greatest. After changing scaling to false and rerunning the code, the clustering results without scaling produced simpler patterns. Due to the influence of the first principal component, the optimal k was also calculated as 3. Running the analysis with 6 clusters showed weather type patterns that were highly similar, differing only in positive and negative sign.
+
 - What is the impact of changing the number of clusters (k) on the weather type patterns?
+> If k is too small, multiple patterns may be grouped together. This simplifies the weather types and can cause detailed patterns to be ignored. Conversely, if k is too large, patterns become more segmented, but multiple similar patterns can probably emerge. 
