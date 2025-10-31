@@ -1,0 +1,587 @@
+---
+title: "CEVE 543 Fall 2025 Lab 8: Weather Typing Implementation"
+subtitle: "K-means clustering for synoptic pattern classification"
+author: CEVE 543 Fall 2025
+date: "2025-10-31"
+type: "lab"
+module: 2
+week: 11
+objectives:
+  - "Implement k-means clustering algorithm"
+  - "Apply k-means to atmospheric streamfunction fields"
+  - "Identify and interpret weather regimes"
+  - "Understand appropriate use cases and limitations"
+ps_connection: "Develops weather typing skills for PS2 Part 2 problems"
+
+engine: julia
+
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-block-bg: "#f8f8f8"
+    code-block-border-left: "#e1e4e5"
+    theme: simplex
+    number-sections: true
+    fig-format: svg
+  typst:
+    fontsize: 11pt
+    margin: 
+      x: 1in
+      y: 1in
+    number-sections: true
+    fig-format: svg
+
+execute: 
+  cache: true
+  freeze: auto
+
+# Code formatting options
+code-overflow: wrap
+code-line-numbers: false
+code-block-font-size: "0.85em"
+---
+
+## Objectives
+
+1. Implement k-means clustering algorithm
+1. Apply k-means to atmospheric streamfunction fields
+1. Identify and interpret weather regimes
+1. Understand appropriate use cases and limitations
+
+## Before
+
+1. Instantiate the project environment so all packages are installed.
+1. If time permits, explore the background reading and data download script.
+
+## Background and Reading
+
+This lab reproduces the weather typing analysis from:
+
+> Doss-Gollin, J., Muñoz, Á. G., Mason, S. J., & Pastén, M. (2018).
+Heavy rainfall in Paraguay during the 2015-2016 austral summer: causes and sub-seasonal-to-seasonal predictive skill.
+*Journal of Climate*, 31(17), 6669–6685.
+<https://doi.org/10.1175/jcli-d-17-0805.1>
+
+This lab uses the same NCEP/NCAR Reanalysis 2 data as the original paper.
+We focus specifically on the weather typing methodology (PCA and k-means clustering of streamfunction fields) rather than reproducing all analyses from the paper.
+The [streamfunction](https://en.wikipedia.org/wiki/Stream_function) is a scalar field that describes the horizontal flow pattern of the atmosphere, particularly useful for identifying large-scale circulation features.
+
+### Data Download
+
+This lab includes a Python script ([get_data.py](get_data.py)) for downloading NCEP/NCAR Reanalysis 2 wind data from NOAA PSL.
+The code is based on the paper, but somewhat simplified.
+See [`windspharm`](https://ajdawson.github.io/windspharm/) docs for more details on the streamfunction calculations.
+
+## Code
+
+We begin with usual project management
+
+```{julia}
+#| output: false
+using Pkg
+lab_dir = dirname(@__FILE__)
+Pkg.activate(lab_dir)
+# Pkg.instantiate() # uncomment this the first time you run the lab to install packages, then comment it back
+```
+
+and load all packages
+
+```{julia}
+using YAXArrays
+using NetCDF
+using CairoMakie
+using GeoMakie
+using MultivariateStats
+using Statistics
+using LaTeXStrings
+using DimensionalData
+using NaturalEarth
+```
+
+## Implementing K-means Clustering
+
+::: {.callout-important}
+## Your First Task
+
+Before working with weather data, implement the core k-means algorithm.
+Open [kmeans.jl](kmeans.jl) and complete these two functions:
+
+1. **`assign_to_nearest_centroid`**: Assign each data point to its nearest centroid
+2. **`update_centroids`**: Update centroids as the mean of assigned points
+
+The scaffolding is provided.
+Current implementations are intentionally wrong but syntactically valid.
+:::
+
+### Testing Your Implementation
+
+Test your k-means implementation with simple synthetic data before applying it to weather patterns:
+
+```{julia}
+# Load your implementation
+include("kmeans.jl")
+
+# Create simple 2D test data with clear clusters
+using Random
+Random.seed!(42)
+cluster1 = randn(50, 2) .+ [0.0 0.0]   # Centered at origin
+cluster2 = randn(50, 2) .+ [5.0 5.0]   # Centered at (5,5)
+cluster3 = randn(50, 2) .+ [5.0 -5.0]  # Centered at (5,-5)
+test_data = vcat(cluster1, cluster2, cluster3)
+
+# Run k-means
+test_result = kmeans(test_data, 3; verbose=true)
+
+# Visualize results
+let
+    fig = Figure(size=(800, 600))
+    ax = Axis(fig[1, 1],
+        title="K-means Test Results",
+        xlabel="Feature 1",
+        ylabel="Feature 2")
+
+    # Plot points colored by cluster
+    colors = [:red, :blue, :green]
+    for k in 1:3
+        cluster_points = test_data[test_result.labels.==k, :]
+        scatter!(ax, cluster_points[:, 1], cluster_points[:, 2],
+            color=colors[k], label="Cluster $k", markersize=8)
+    end
+
+    # Plot centroids
+    scatter!(ax, test_result.centroids[:, 1], test_result.centroids[:, 2],
+        color=:black, marker=:xcross, markersize=20, label="Centroids")
+
+    axislegend(ax, position=:rt)
+    fig
+end
+```
+
+::: {.callout-tip}
+## Expected Results
+
+With the broken implementation, you'll see random cluster assignments with centroids at random points within each cluster.
+The results will look messy and won't match the true cluster structure.
+
+Once you correctly implement both functions, you should see three distinct clusters with centroids near (0,0), (5,5), and (5,-5).
+:::
+
+## Helper Functions
+
+Define helper functions for plotting.
+Colormaps for absolute values and diverging data (anomalies):
+
+```{julia}
+#| output: false
+cmap_absolute = :plasma
+cmap_diverging = :PuOr
+```
+
+Helper function to ensure diverging colormaps are centered at zero:
+
+```{julia}
+#| output: false
+function diverging_colormap(data, colormap=:PuOr)
+    # Find the maximum absolute value to center the colormap at zero
+    max_abs = maximum(abs.(skipmissing(data)))
+    return (colormap, (-max_abs, max_abs))
+end
+```
+
+Helper functions to create GeoAxes with consistent styling and add national boundaries:
+
+```{julia}
+#| output: false
+function create_geoaxis(fig, position; title="", kwargs...)
+    return GeoAxis(fig[position...],
+        title=title,
+        dest="+proj=latlong +datum=WGS84",
+        xgridvisible=false,
+        ygridvisible=false;
+        kwargs...)
+end
+```
+
+## Load and Visualize Data
+
+Load the streamfunction data using `YAXArrays`.
+The file contains daily 850 hPa streamfunction data over the South American region.
+
+```{julia}
+# Load the regional streamfunction file
+data_dir = joinpath(lab_dir, "data")
+streamfunction_file = joinpath(data_dir, "ncep_streamfunction_regional_1979_2025.nc")
+
+# Open the dataset
+ds = open_dataset(streamfunction_file)
+ds
+```
+
+Extract the streamfunction variable, convert units to 10^6 m²/s, and convert longitudes from 0-360 to -180-180 format:
+
+```{julia}
+#| output: false
+
+ψ = ds[:streamfunction] ./ 1e6
+
+lon_values = Array(ψ.lon)
+lon_converted = ifelse.(lon_values .> 180, lon_values .- 360, lon_values)
+ψ = DimensionalData.set(ψ, :lon => lon_converted)
+
+lon_lims = extrema(ψ.lon)
+lat_lims = extrema(ψ.lat)
+```
+
+Add a helper function for plotting national boundaries:
+
+```{julia}
+#| output: false
+countries = naturalearth("admin_0_countries", 110)
+function add_boundaries!(ax)
+    poly!(ax,
+        GeoMakie.to_multipoly(countries.geometry); color=:transparent,
+        strokecolor=:black,
+        strokewidth=1.5
+    )
+    xlims!(ax, lon_lims...)
+    ylims!(ax, lat_lims...)
+end
+```
+
+Calculate the climatology (summer mean) and anomalies.
+In practice, we often compute climatologies by month or use a smooth transition to avoid discontinuities at month boundaries, but here we will calculate a single mean for the entire summer season:
+
+```{julia}
+#| output: false
+# Load data into memory
+ψ = readcubedata(ψ)
+
+# Calculate climatology as the mean over all time steps
+ψ_climatology = mean(ψ, dims=:time)[:, :, 1]
+
+# Calculate anomalies as observations minus climatology
+ψ_anomaly = ψ .- ψ_climatology
+```
+
+Visualize the climatology:
+
+```{julia}
+let
+    fig = Figure()
+    ax = create_geoaxis(fig, (1, 1); title="850 hPa Streamfunction Climatology (Nov-Feb)")
+    hm = heatmap!(ax, ψ_climatology; colormap=cmap_absolute)
+    add_boundaries!(ax)
+    Colorbar(fig[1, 2], hm, label=L"$\bar{\psi}$ ($10^6$ m$^2$/s)")
+    fig
+end
+```
+
+Visualize the anomalies for a sample day:
+
+```{julia}
+function plot_streamfunction_anomaly(sample_date::Date)
+    subset = ψ_anomaly[time=At(sample_date)]
+
+    # Get centered colormap
+    cmap, crange = diverging_colormap(subset, cmap_diverging)
+
+    fig = Figure()
+    ax = create_geoaxis(fig, (1, 1); title="850 hPa Streamfunction Anomaly on ($(sample_date))")
+    hm = heatmap!(ax, subset; colormap=cmap, colorrange=crange)
+    add_boundaries!(ax)
+    Colorbar(fig[1, 2], hm, label=L"Streamfunction Anomaly ($10^6$ m$^2$/s)")
+    fig
+end
+plot_streamfunction_anomaly(Date(2015, 12, 14))
+```
+
+### Step 1: Principal Component Analysis
+
+Apply PCA to the anomaly data using MultivariateStats.jl.
+PCA decomposes the spatial patterns into a set of orthogonal modes (EOFs) and their time series (PC scores).
+
+While there are packages that are specifically designed to handle the EOF analysis, we will do it mostly by hand here to see how we need to convert from 3D data to 2D matrices and back.
+
+First, convert the anomaly data to an array and determine its dimensions:
+
+```{julia}
+ψ_array = Array(ψ_anomaly)
+nlons, nlats, ntimes = size(ψ_array)
+```
+
+Reshape the 3D array (lon, lat, time) into a 2D matrix (space × time) for PCA.
+Each column represents one time step, and each row represents one spatial location:
+
+```{julia}
+ψ_matrix = reshape(ψ_array, (nlons * nlats, ntimes))
+println("Reshaped to: $(size(ψ_matrix)) (space × time)")
+```
+
+First, fit a PCA model with many components to examine the variance explained:
+
+```{julia}
+#| output: false
+pca_model_full = fit(PCA, ψ_matrix; maxoutdim=20)
+explained_var_full = principalvars(pca_model_full)
+total_var = var(pca_model_full)
+explained_var_ratio_full = explained_var_full ./ total_var
+```
+
+Create a scree plot to help choose the number of PCs to retain:
+
+```{julia}
+let
+    n_show = min(10, length(explained_var_ratio_full))
+    fig = Figure(size=(800, 600))
+
+    ax1 = Axis(fig[1, 1],
+        xlabel="PC Number",
+        ylabel="Explained Variance Ratio",
+        title="Scree Plot",
+        xticks=1:n_show)
+    scatter!(ax1, 1:n_show, explained_var_ratio_full[1:n_show])
+    lines!(ax1, 1:n_show, explained_var_ratio_full[1:n_show])
+
+    ax2 = Axis(fig[2, 1],
+        xlabel="Number of PCs",
+        ylabel="Cumulative Variance Explained",
+        title="Cumulative Variance",
+        xticks=1:n_show)
+    cumvar = cumsum(explained_var_ratio_full)
+    lines!(ax2, 1:n_show, cumvar[1:n_show])
+    hlines!(ax2, [0.9], color=:red, linestyle=:dash, label="90% threshold")
+    axislegend(ax2, position=:rb)
+
+    fig
+end
+```
+
+Following the paper, we will retain 4 principal components:
+
+```{julia}
+n_pcs_retain = 4
+pca_model = fit(PCA, ψ_matrix; maxoutdim=n_pcs_retain)
+
+# Calculate explained variance ratio for the retained PCs
+explained_var = principalvars(pca_model)
+total_var = var(pca_model)
+explained_var_ratio = explained_var ./ total_var
+```
+
+Transform the data into PC space to get the PC scores (time series):
+
+```{julia}
+pc_scores = MultivariateStats.transform(pca_model, ψ_matrix)'
+println("PC scores shape: $(size(pc_scores))")
+```
+
+Extract the EOFs (spatial patterns):
+
+```{julia}
+eof_patterns_flat = projection(pca_model)
+println("EOF patterns shape: $(size(eof_patterns_flat))")
+```
+
+Visualize the spatial patterns (EOFs) for each principal component.
+EOFs show the characteristic spatial patterns of variability, with the first EOF explaining the most variance:
+
+```{julia}
+let
+    n_pcs = size(eof_patterns_flat, 2)
+    fig = Figure(size=(1200, 800))
+
+    # Determine shared color range across all EOFs
+    all_eofs = [reshape(eof_patterns_flat[:, i], (nlons, nlats)) for i in 1:n_pcs]
+    max_abs = maximum(abs.(vcat([vec(eof) for eof in all_eofs]...)))
+    crange = (-max_abs, max_abs)
+
+    # Plot each EOF
+    for i in 1:n_pcs
+        row = div(i - 1, 2) + 1
+        col = mod(i - 1, 2) + 1
+
+        ax = create_geoaxis(fig, (row, col);
+            title="EOF $i ($(round(explained_var_ratio[i]*100, digits=1))%)")
+
+        eof_spatial = all_eofs[i]
+        hm = heatmap!(ax, Array(ψ_climatology.lon), Array(ψ_climatology.lat), eof_spatial;
+            colormap=cmap_diverging, colorrange=crange)
+        add_boundaries!(ax)
+    end
+
+    # Add shared colorbar
+    Colorbar(fig[:, 3], limits=crange, colormap=cmap_diverging, label="EOF Loading")
+
+    fig
+end
+```
+
+#### Temporal Evolution of Principal Components
+
+Before clustering, let's examine how the principal components vary over time.
+This helps us understand the temporal dynamics captured by each PC.
+
+```{julia}
+let
+    # Extract time dimension from the data and convert to Array
+    time_dim = Array(lookup(ψ_anomaly, :time))
+
+    # Extract time period: November 2015 through February 2016
+    time_mask = (time_dim .>= Date(2015, 11, 1)) .& (time_dim .<= Date(2016, 2, 29))
+    time_subset = time_dim[time_mask]
+    pc_subset = pc_scores[time_mask, 1:4]  # First 4 PCs
+
+    # Create time series plot
+    fig = Figure(size=(1200, 800))
+
+    for i in 1:4
+        ax = Axis(fig[i, 1],
+            xlabel=(i == 4 ? "Date" : ""),
+            ylabel="PC $i",
+            title="Principal Component $i ($(round(explained_var_ratio[i]*100, digits=1))% variance)")
+
+        lines!(ax, time_subset, pc_subset[:, i], color=:steelblue, linewidth=1.5)
+        hlines!(ax, [0], color=:gray, linestyle=:dash, linewidth=1)
+    end
+
+    fig
+end
+```
+
+### Step 2: K-means Clustering
+
+K-means clustering identifies distinct weather patterns in the PC space.
+You should have already implemented the core functions in [kmeans.jl](kmeans.jl).
+If you haven't done so yet, scroll back up to the "Implementing K-means Clustering" section.
+
+Load your k-means implementation:
+
+```{julia}
+#| output: false
+include("kmeans.jl")
+```
+
+#### Apply K-means to Weather Typing
+
+We'll use k-means to identify distinct weather patterns in the PC space.
+Each "weather type" represents a recurring synoptic pattern.
+
+First, we prepare the data.
+Rescaling PCs to have equal variance gives each mode equal importance in the clustering.
+
+```{julia}
+#| output: false
+rescale_pcs = true
+if rescale_pcs
+    pc_scores_scaled = (pc_scores .- mean(pc_scores, dims=1)) ./ std(pc_scores, dims=1)
+else
+    pc_scores_scaled = pc_scores
+end
+```
+
+#### Choosing the Number of Clusters
+
+The elbow method helps select an appropriate number of clusters.
+We run k-means for different values of k and plot the within-cluster sum of squares (WCSS).
+Look for an "elbow" where adding more clusters gives diminishing returns.
+
+```{julia}
+let
+    k_values = 3:10
+    wcss_values = [kmeans(pc_scores_scaled, k; verbose=false).wcss for k in k_values]
+
+    fig = Figure(size=(800, 600))
+    ax = Axis(fig[1, 1],
+        xlabel="Number of Clusters",
+        ylabel="Within-Cluster Sum of Squares",
+        title="Elbow Method for Optimal k",
+        xticks=k_values)
+    lines!(ax, k_values, wcss_values, color=:steelblue, linewidth=2)
+    scatter!(ax, k_values, wcss_values, color=:steelblue, markersize=12)
+    fig
+end
+```
+
+Based on the elbow plot, choose a number of clusters and run k-means:
+
+```{julia}
+n_clusters = 6
+result = kmeans(pc_scores_scaled, n_clusters; verbose=true)
+
+println("\nConverged: $(result.converged)")
+println("Iterations: $(result.iterations)")
+println("Final WCSS: $(round(result.wcss, digits=2))")
+
+println("\nCluster sizes (ordered largest to smallest):")
+for i in 1:n_clusters
+    count = sum(result.labels .== i)
+    println("  Cluster $i: $count days ($(round(count/length(result.labels)*100, digits=1))%)")
+end
+```
+
+### Step 3: Visualize Weather Types
+
+Create composite maps showing the typical streamfunction pattern for each weather type.
+Each composite represents the average circulation anomaly for all days assigned to that cluster.
+
+```{julia}
+let
+    # Calculate composite (mean) streamfunction anomaly for each cluster
+    composites = zeros(nlons, nlats, n_clusters)
+
+    for k in 1:n_clusters
+        cluster_days = findall(result.labels .== k)
+        cluster_data = ψ_array[:, :, cluster_days]
+        composites[:, :, k] = mean(cluster_data, dims=3)[:, :, 1]
+    end
+
+    # Determine color range for consistent scaling across all plots
+    crange = maximum(abs.(extrema(composites)))
+    crange = (-crange, crange)
+
+    # Plot all weather type composites
+    fig = Figure(size=(1400, 1000))
+
+    for k in 1:n_clusters
+        row = div(k - 1, 3) + 1
+        col = mod(k - 1, 3) + 1
+
+        ax = create_geoaxis(fig, (row, col);
+            title="Weather Type $k (n=$(sum(result.labels .== k)))")
+
+        hm = heatmap!(ax, Array(ψ_climatology.lon), Array(ψ_climatology.lat), composites[:, :, k];
+            colormap=cmap_diverging, colorrange=crange)
+        add_boundaries!(ax)
+    end
+
+    # Add single shared colorbar
+    Colorbar(fig[:, 4], limits=crange, colormap=cmap_diverging,
+        label=L"$\psi$ Anomaly ($10^6$ m$^2$/s)")
+
+    fig
+end
+```
+
+**Interpretation**: Each weather type shows a distinct circulation pattern.
+Look for regions of positive (anticyclonic) and negative (cyclonic) streamfunction anomalies.
+The largest cluster (Weather Type 1) typically represents the most common circulation pattern during the season.
+
+## Analysis Questions
+
+Answer the following questions about the weather typing methodology:
+
+### Implementation Questions
+
+- Explain in your own words what the `assign_to_nearest_centroid` function does and why it's important for k-means clustering.
+- Explain in your own words what the `update_centroids` function does and why it's important for k-means clustering.
+- Why does k-means use squared Euclidean distance rather than absolute distance? What would happen if you used absolute distance instead?
+
+### Weather Typing Analysis
+
+- Visualize streamfunction anomalies for at least 3 different days. Then, identify the weather types for each day. How well do individual days match their cluster composite patterns?
+- Do your EOF spatial patterns match those shown in the paper?
+- Do your weather type composites used with default settings (approximately matching the paper) match those in the paper? If not, why might they differ?
+- What is the effect of changing the number of retained PCs on the weather type patterns?
+- What is the effect of rescaling PCs before clustering? Try clustering without rescaling and compare results.
+- What is the impact of changing the number of clusters (k) on the weather type patterns?

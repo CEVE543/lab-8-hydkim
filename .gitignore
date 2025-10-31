@@ -1,0 +1,9 @@
+*_files/
+*.html
+*.pdf
+.cache
+.jupyter_cache
+Manifest.toml
+data/
+
+!data/ncep_streamfunction_regional_1979_2025.nc
